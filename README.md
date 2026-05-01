@@ -1,4 +1,7 @@
-# SQLi Auditor 
+# SQLi Auditor - Beta (v-1.0)
+
+<a href="https://ibb.co/TDMQbMBZ"><img src="https://i.ibb.co/0py0Fyjk/sqli-checker.png" alt="sqli-checker" border="0"></a>
+## ------------------------------------------------------------------------------------------------------------------------
 
 ## It's Beta Version! 
 
