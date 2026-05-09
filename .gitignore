@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+
+# Project specific
+logs/
+outputs/
+payloads/*.txt
+!payloads/example.txt

@@ -1,3 +1,5 @@
-requests
+python-dotenv
 colorama
-pysocks
+requests
+urllib3
+psutil

